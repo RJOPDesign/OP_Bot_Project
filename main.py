@@ -1,252 +1,172 @@
+"""
+Main entry for OP Bot — menu-only moderation suite.
+
+Loads cogs, wires Mongo (optional), registers persistent views, and ensures a
+main control panel is posted in each guild where the bot can speak.
+
+Environment variables (.env):
+- DISCORD_BOT_TOKEN: required
+- MONGO_URI: optional (enables persistence for configs, tickets, giveaways)
+- BOT_PREFIX: optional (unused for menus but required by commands.Bot)
+- LOG_LEVEL: optional (DEBUG/INFO/WARNING/ERROR) — default INFO
+"""
+from __future__ import annotations
+
 import os
+import asyncio
+import logging
+from typing import Optional
+
 import discord
 from discord.ext import commands
 from dotenv import load_dotenv
-from motor.motor_asyncio import AsyncIOMotorClient
-from pymongo.errors import ConnectionFailure, OperationFailure, NetworkTimeout
-import logging
-from logging.handlers import RotatingFileHandler
-from typing import List
-import asyncio
-from copy import deepcopy
 
-# --- Setup Logging ---
-log_dir = 'logs'
-if not os.path.exists(log_dir):
-    os.makedirs(log_dir)
+try:
+    from motor.motor_asyncio import AsyncIOMotorClient  # type: ignore
+except Exception:  # motor optional
+    AsyncIOMotorClient = None  # type: ignore
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
-logger = logging.getLogger(__name__)
-# Use RotatingFileHandler to prevent log files from growing indefinitely
-handler = RotatingFileHandler(filename=f'{log_dir}/discord.log', encoding='utf-8', mode='a', maxBytes=5*1024*1024, backupCount=2)
-handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
-logger.addHandler(handler)
+# ----------------- Logging -----------------
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="[%(asctime)s] [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger("opbot")
 
+# ----------------- Intents -----------------
+intents = discord.Intents.default()
+intents.guilds = True
+intents.members = True
+intents.messages = True
+intents.message_content = False  # keep disabled unless absolutely needed
+intents.reactions = True
 
-# --- Load and Validate Environment Variables ---
-load_dotenv()
-TOKEN = os.getenv('DISCORD_BOT_TOKEN')
-MONGO_URI = os.getenv('MONGO_URI')
-# Configurable DB connection settings with defaults
-MONGO_MAX_POOL_SIZE = int(os.getenv('MONGO_MAX_POOL_SIZE', 100))
-MONGO_MIN_POOL_SIZE = int(os.getenv('MONGO_MIN_POOL_SIZE', 10))
-MONGO_MAX_RETRIES = int(os.getenv('MONGO_MAX_RETRIES', 3))
-MONGO_RETRY_DELAY = float(os.getenv('MONGO_RETRY_DELAY', 2))
-
-
-def validate_env_vars():
-    """Ensures all required environment variables are set."""
-    if not TOKEN:
-        logger.critical("❌ DISCORD_BOT_TOKEN environment variable not found.")
-        raise SystemExit("Missing DISCORD_BOT_TOKEN")
-    if not MONGO_URI:
-        logger.critical("❌ MONGO_URI environment variable not found.")
-        raise SystemExit("Missing MONGO_URI")
-    if MONGO_MAX_POOL_SIZE < MONGO_MIN_POOL_SIZE:
-        logger.critical("❌ MONGO_MAX_POOL_SIZE cannot be less than MONGO_MIN_POOL_SIZE.")
-        raise SystemExit("Invalid MongoDB pool sizes")
-
-# --- Default Guild Configuration ---
-DEFAULT_CONFIG = {
-    "guild_id": None,
-    "ai_moderation": {
-        "enabled": True, "exempt_roles": [], "exempt_users": [], "log_channel_id": None,
-        "actions": {"warn_user": True, "delete_message": True, "timeout_user": False},
-        "filters": {
-            "toxicity": {"enabled": True, "sensitivity": 0.85}, "hate_speech": {"enabled": True, "sensitivity": 0.90},
-            "spam": {"enabled": True, "sensitivity": 3}, "profanity": {"enabled": True, "custom_word_list": []},
-            "server_invites": {"enabled": True}
-        }
-    },
-    "anti_raid": {
-        "enabled": True, "log_channel_id": None, "alert_role_id": None,
-        "join_gate": {"enabled": True, "joins": 10, "seconds": 15},
-        "account_age_gate": {"enabled": True, "hours": 24},
-        "anti_nuke": {"enabled": False, "action_threshold": 5, "timeframe_seconds": 10}
-    },
-    "logging": {
-        "enabled": True, "log_channel_id": None,
-        "enabled_events": [
-            "message_delete", "message_edit", "member_join", "member_leave", 
-            "member_role_update", "member_nick_update", "channel_events"
-        ]
-    },
-    "tickets": {
-        "enabled": True, "log_channel_id": None, "panels": [], "transcripts_channel_id": None
-    },
-    "welcome": {
-        "enabled": False,
-        "welcome_channel_id": None,
-        "goodbye_channel_id": None,
-        "welcome_message": "Welcome {user} to {server}!",
-        "goodbye_message": "{user} has left the server.",
-        "welcome_dm": "Welcome to {server}, {user}!"
-    },
-    "levels": {
-        "enabled": False,
-        "channel_id": None,
-        "level_up_message": "Congrats {user}, you've reached level {level}!"
-    },
-    "invites": {
-        "enabled": False,
-        "rewards": [],
-        "no_invite_roles": []
-    },
-    "statistics": {
-        "enabled": False,
-        "channel_id": None
-    },
-    "temp_channels": {
-        "enabled": False,
-        "create_channel_id": None,
-        "category_id": None
-    },
-    "social_alerts": {
-        "enabled": False
-    },
-    "achievements": {
-        "enabled": False,
-        "achievements": []
-    },
-    "reaction_roles": [],
-    "birthdays": {
-        "enabled": False,
-        "channel_id": None,
-        "role_id": None,
-        "dm_on_join": False
-    },
-    "economy": {
-        "enabled": True
-    }
-}
 
 class OPBot(commands.Bot):
-    """The main bot class for OPBot. Uses slash commands only."""
-    def __init__(self):
-        intents = discord.Intents(
-            guilds=True,
-            members=True,
-            messages=True,
-            message_content=True,
-            reactions=True,
-            voice_states=True
-        )
-        super().__init__(command_prefix=None, intents=intents)
-        self.db = None
-        self.mongo_client = None
-        self._default_config = deepcopy(DEFAULT_CONFIG) # Cache the default config
-
-    async def close(self):
-        """Clean up resources before shutting down."""
-        logger.info("🛑 Shutting down bot...")
-        if self.mongo_client:
-            self.mongo_client.close()
-            logger.info("✅ MongoDB client closed.")
-        await super().close()
-
-    async def setup_database(self):
-        """Initializes the async database connection with exponential backoff."""
-        for attempt in range(MONGO_MAX_RETRIES):
-            try:
-                self.mongo_client = AsyncIOMotorClient(
-                    MONGO_URI,
-                    maxPoolSize=MONGO_MAX_POOL_SIZE,
-                    minPoolSize=MONGO_MIN_POOL_SIZE
-                )
-                await self.mongo_client.admin.command('ismaster')
-                self.db = self.mongo_client['OP_Bot_DB']
-                # Create indexes for performance
-                await self.db.configs.create_index("guild_id", unique=True)
-                await self.db.reminders.create_index("due_time")
-                await self.db.social_alerts.create_index([("guild_id", 1), ("platform", 1)])
-                await self.db.birthdays.create_index([("month", 1), ("day", 1)])
-                await self.db.economy.create_index("user_id")
-                logger.info("✅ Successfully connected to MongoDB and ensured indexes.")
-                return
-            except ConnectionFailure as e:
-                logger.error(f"Attempt {attempt + 1}/{MONGO_MAX_RETRIES} failed to connect to MongoDB: {e}")
-                if attempt + 1 == MONGO_MAX_RETRIES:
-                    logger.critical("❌ Max retries reached. Bot cannot start.")
-                    raise SystemExit(f"Database connection failed: {e}") from e
-                await asyncio.sleep(MONGO_RETRY_DELAY * (2 ** attempt)) # Exponential backoff
-            except Exception as e:
-                logger.critical(f"Unexpected error during database setup: {e}")
-                raise
-
-    async def get_guild_config(self, guild_id: int) -> dict:
-        """Retrieves guild configuration from the database asynchronously."""
-        if self.db is None:
-            logger.error("Database connection is not available.")
-            config = deepcopy(self._default_config)
-            config["guild_id"] = guild_id
-            return config
-        try:
-            config = await self.db.configs.find_one({"guild_id": guild_id})
-            if not config:
-                logger.info(f"No config found for guild {guild_id}. Creating a new one.")
-                new_config = deepcopy(self._default_config)
-                new_config["guild_id"] = guild_id
-                await self.db.configs.insert_one(new_config)
-                return new_config
-            return config
-        except NetworkTimeout:
-            logger.warning(f"Network timeout fetching config for guild {guild_id}. Returning default config.")
-            config = deepcopy(self._default_config)
-            config["guild_id"] = guild_id
-            return config
-        except OperationFailure as e:
-            logger.error(f"Database operation failed for guild {guild_id}: {e}")
-            raise
-        except Exception as e:
-            logger.critical(f"Unexpected error fetching guild config for guild {guild_id}: {e}")
-            raise
-
-    async def setup_hook(self):
-        """Sets up the bot by connecting to the DB, registering views, and loading cogs."""
-        await self.setup_database()
-
-        try:
-            from cogs.ticket_cog import TicketActionsView
-            # CORRECTED: Removed TicketPanelView registration as it requires a panel_id at initialization
-            self.add_view(TicketActionsView(self))
-            logger.info("✅ All persistent views registered.")
-        except ImportError as e:
-            logger.critical(f"❌ Failed to import a view for registration. Error: {e}")
-            raise
-        except Exception as e:
-            logger.critical(f"❌ Failed to register persistent views: {e}")
-            raise
-
-        logger.info("⚙️  Loading cogs...")
-        cogs_to_load = [
-            'menu_cog', 'ticket_cog', 'logging_cog', 'moderation_cog', 
-            'essentials_cog', 'purge_cog', 'music_cog', 
-            'giveaways_cog'
+    def __init__(self) -> None:
+        super().__init__(command_prefix=os.getenv("BOT_PREFIX", "!"), intents=intents)
+        self.db = None  # type: ignore
+        self.mongo_client: Optional[AsyncIOMotorClient] = None  # type: ignore
+        self._start_time = None
+        self.initial_extensions = [
+            "cogs.menu_cog",
+            "cogs.moderation_cog",
+            "cogs.logging_cog",
+            "cogs.ticket_cog",
+            "cogs.essentials_cog",
+            "cogs.giveaways_cog",
+            "cogs.purge_cog",
+            "cogs.music_cog",
         ]
-        
-        for cog in cogs_to_load:
-            try:
-                await self.load_extension(f'cogs.{cog}')
-                logger.info(f"  -> Loaded cog: {cog}.py")
-            except Exception as e:
-                logger.critical(f"  -> FAILED to load cog {cog}: {e}")
-                raise
 
-        logger.info("✅ Cogs loaded.")
-        
+    async def setup_hook(self) -> None:
+        # Start time for uptime
+        import time as _time
+        self._start_time = _time.time()
+
+        # Wire DB if available
+        mongo_uri = os.getenv("MONGO_URI")
+        if mongo_uri and AsyncIOMotorClient is not None:
+            try:
+                self.mongo_client = AsyncIOMotorClient(mongo_uri)
+                self.db = self.mongo_client["opbot"]
+                logger.info("Mongo connected (opbot DB).")
+            except Exception:
+                logger.exception("Failed to connect to Mongo; continuing without persistence.")
+        elif mongo_uri and AsyncIOMotorClient is None:
+            logger.warning("MONGO_URI set but 'motor' not installed. Add 'motor' to requirements.txt.")
+
+        # Load extensions
+        for ext in self.initial_extensions:
+            try:
+                await self.load_extension(ext)
+                logger.info(f"Loaded extension: {ext}")
+            except Exception:
+                logger.exception(f"Failed to load extension: {ext}")
+
+        # Register persistent views proactively (cogs also register theirs)
         try:
-            await self.tree.sync()
-            logger.info("✅ Global command tree synced.")
-        except Exception as e:
-            logger.error(f"Failed to sync command tree: {e}")
+            from cogs.menu_cog import MainMenuView
+            self.add_view(MainMenuView(self))
+        except Exception:
+            pass
 
     async def on_ready(self):
-        logger.info(f'🤖 Logged in as {self.user} (ID: {self.user.id})')
-        logger.info('-----------------------------------------')
-        await self.change_presence(activity=discord.Game(name="Watching Servers | /menu"))
+        logger.info(f"Logged in as {self.user} (ID: {self.user and self.user.id})")
+        await self.ensure_guild_panels()
 
-bot = OPBot()
+    # ----------------- Panel helpers -----------------
+    async def ensure_guild_panels(self):
+        """Post/refresh a single control panel message per guild in a sensible channel."""
+        from utils import ensure_guild_config
+        from cogs.menu_cog import build_main_embed, MainMenuView
+
+        for guild in list(self.guilds):
+            try:
+                await ensure_guild_config(self, guild.id)
+            except Exception:
+                logger.exception("ensure_guild_config failed")
+
+            channel = self._pick_announce_channel(guild)
+            if not channel:
+                logger.warning(f"No writable channel found for guild {guild.id}")
+                continue
+
+            try:
+                # Try to find an existing panel in recent history and refresh it
+                found = None
+                async for msg in channel.history(limit=100):
+                    if msg.author.id == self.user.id and msg.embeds:
+                        emb = msg.embeds[0]
+                        if emb.footer and emb.footer.text == "OP Control Panel":
+                            found = msg
+                            break
+                if found:
+                    await found.edit(embed=build_main_embed(guild), view=MainMenuView(self))
+                else:
+                    await channel.send(embed=build_main_embed(guild), view=MainMenuView(self))
+            except discord.Forbidden:
+                logger.warning(f"Missing permissions to send/edit messages in {guild.id}#{channel.id}")
+            except Exception:
+                logger.exception("Failed to ensure control panel")
+
+    def _pick_announce_channel(self, guild: discord.Guild) -> Optional[discord.TextChannel]:
+        # Prefer system channel if send allowed
+        if guild.system_channel and guild.system_channel.permissions_for(guild.me).send_messages:  # type: ignore
+            return guild.system_channel  # type: ignore
+        # Otherwise pick first text channel where bot can speak
+        for ch in guild.text_channels:
+            try:
+                perms = ch.permissions_for(guild.me)
+                if perms.send_messages and perms.read_messages:
+                    return ch
+            except Exception:
+                continue
+        return None
+
+
+async def main():
+    load_dotenv()
+    token = os.getenv("DISCORD_BOT_TOKEN")
+    if not token:
+        raise RuntimeError("DISCORD_BOT_TOKEN missing in environment. Create a .env with it or set env var.")
+
+    bot = OPBot()
+    async with bot:
+        try:
+            await bot.start(token)
+        finally:
+            # Graceful close of Mongo client
+            if getattr(bot, "mongo_client", None):
+                try:
+                    bot.mongo_client.close()
+                except Exception:
+                    pass
+
 
 if __name__ == "__main__":
-    validate_env_vars()
-    bot.run(TOKEN, log_handler=handler)
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Shutting down…")

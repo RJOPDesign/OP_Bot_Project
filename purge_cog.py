@@ -1,212 +1,233 @@
+"""
+Purge cog — menu-only advanced message cleanup tools.
+
+Features
+- Purge Recent: delete N most recent messages in the current channel (<= 1000 scanned)
+- Purge By User: delete N messages by a specific user
+- Purge Contains: delete N messages containing a keyword/phrase
+- Purge Links: delete N messages that contain links
+- Purge Bots: delete N messages sent by bots
+- All actions are admin-only and perform safe, rate-limit-friendly deletions
+- Works even for messages older than 14 days by deleting one-by-one (Discord limitation)
+- Persistent view with stable custom_ids; safe ephemeral responses to avoid "Interaction Failed"
+
+Integrations
+- utils.mk_embed, utils.admin_only
+"""
+from __future__ import annotations
+
+import re
+from typing import Optional, Callable, Awaitable
+
 import discord
-from discord import app_commands
 from discord.ext import commands
-from discord.ui import View, Button, Modal, TextInput, UserSelect
-import logging
-from typing import Optional
-import asyncio
 
-# Import from the utils cog for consistency
-from .utils import BaseSettingsView, create_embed, STRINGS
+from utils import mk_embed, admin_only
 
-logger = logging.getLogger(__name__)
 
-# --- Modals for Purge Feature ---
+# ----------------- Embed -----------------
 
-class PurgeFilterModal(Modal, title="Advanced Purge Options"):
-    """A modal to configure advanced purge settings."""
-    def __init__(self, bot: commands.Bot, target_user: Optional[discord.User] = None):
-        super().__init__()
-        self.bot = bot
-        self.target_user = target_user
-        self.amount = TextInput(
-            label="Number of messages to check (1-1000)",
-            required=True,
-            max_length=4,
-            placeholder="Enter a number between 1 and 1000"
-        )
-        self.keyword = TextInput(
-            label="Keyword to filter (optional)",
-            required=False,
-            placeholder="Enter a keyword to match (case-insensitive)"
-        )
-        self.message_type = TextInput(
-            label="Message type (optional: bot, embed, attachment)",
-            required=False,
-            placeholder="Enter 'bot', 'embed', or 'attachment' to filter"
-        )
-        self.add_item(self.amount)
-        self.add_item(self.keyword)
-        self.add_item(self.message_type)
+def build_purge_embed(guild: discord.Guild) -> discord.Embed:
+    desc = (
+        "Advanced purge tools for this channel.\n\n"
+        "• Purge Recent — delete the most recent N messages.\n"
+        "• Purge By User — delete messages by a specific user.\n"
+        "• Purge Contains — delete messages containing a keyword.\n"
+        "• Purge Links — delete messages that contain URLs.\n"
+        "• Purge Bots — delete messages sent by bots.\n\n"
+        "Note: Messages older than 14 days are removed one-by-one (slower)."
+    )
+    return mk_embed("Purge Tools", desc, discord.Color.red())
 
-    async def on_submit(self, interaction: discord.Interaction) -> None:
-        # 1. Validate input
+
+# ----------------- Modals -----------------
+
+class CountOnlyModal(discord.ui.Modal, title="How many messages?"):
+    count = discord.ui.TextInput(label="Count (1–1000)", placeholder="100", required=True, max_length=4)
+
+    def __init__(self, on_submit_cb: Callable[[discord.Interaction, int], Awaitable[None]]):
+        super().__init__(timeout=None)
+        self._cb = on_submit_cb
+
+    async def on_submit(self, interaction: discord.Interaction):
         try:
-            amount = int(self.amount.value) if self.amount.value else 100
-            if not 1 <= amount <= 1000:
-                raise ValueError("Amount must be between 1 and 1000.")
-        except ValueError as e:
-            await interaction.response.send_message(f"❌ Invalid input: {e}. Please check your inputs.", ephemeral=True)
-            return
+            n = max(1, min(1000, int(str(self.count))))
+        except ValueError:
+            return await _safe_ephemeral(interaction, "Enter a whole number between 1 and 1000.")
+        await self._cb(interaction, n)
 
-        # 2. Check permissions
-        if not interaction.channel.permissions_for(interaction.guild.me).manage_messages:
-            await interaction.response.send_message("❌ I don't have the **Manage Messages** permission to do that.", ephemeral=True)
-            return
 
-        # This is the function that will do the actual purging.
-        # It will be called with an interaction that is already deferred.
-        async def do_purge(purge_interaction: discord.Interaction):
+class CountAndUserModal(discord.ui.Modal, title="Purge by user"):
+    user = discord.ui.TextInput(label="User ID or mention", placeholder="123456789012345678 or @User", required=True, max_length=40)
+    count = discord.ui.TextInput(label="Count (1–1000)", placeholder="100", required=True, max_length=4)
+
+    def __init__(self, on_submit_cb: Callable[[discord.Interaction, int, int], Awaitable[None]]):
+        super().__init__(timeout=None)
+        self._cb = on_submit_cb
+
+    async def on_submit(self, interaction: discord.Interaction):
+        # Resolve user id
+        text = str(self.user).strip()
+        uid: Optional[int] = None
+        m = re.search(r"(\d{15,25})", text)
+        if m:
             try:
-                # The interaction is already deferred, so we can proceed.
-                def check(m):
-                    if self.target_user and m.author != self.target_user:
-                        return False
-                    if self.keyword.value and self.keyword.value.lower() not in m.content.lower():
-                        return False
-                    if self.message_type.value:
-                        msg_type = self.message_type.value.lower()
-                        if msg_type == "bot" and not m.author.bot: return False
-                        elif msg_type == "embed" and not m.embeds: return False
-                        elif msg_type == "attachment" and not m.attachments: return False
-                    return True
-
-                # Use the original modal interaction's channel
-                deleted_messages = await interaction.channel.purge(limit=amount, check=check, before=interaction.created_at)
-                deleted_count = len(deleted_messages)
-
-                # Log the purge action
-                config = await self.bot.get_guild_config(interaction.guild.id)
-                log_channel_id = config.get("logging", {}).get("log_channel_id")
-                if log_channel_id:
-                    log_channel = interaction.guild.get_channel(log_channel_id)
-                    if log_channel:
-                        filters = []
-                        if self.target_user: filters.append(f"User: {self.target_user.mention}")
-                        if self.keyword.value: filters.append(f"Keyword: `{self.keyword.value}`")
-                        if self.message_type.value: filters.append(f"Type: `{self.message_type.value}`")
-                        filter_str = ", ".join(filters) if filters else "None"
-                        
-                        embed = create_embed(
-                            "🗑️ Messages Purged (Advanced)",
-                            f"**Moderator**: {interaction.user.mention}\n"
-                            f"**Channel**: {interaction.channel.mention}\n"
-                            f"**Messages Deleted**: {deleted_count}\n"
-                            f"**Filters**: {filter_str}",
-                            discord.Color.dark_red()
-                        )
-                        await log_channel.send(embed=embed)
-                
-                # Use the purge_interaction to send the final confirmation
-                await purge_interaction.followup.send(f"✅ Successfully deleted {deleted_count} messages.", ephemeral=True)
-
-            except Exception as e:
-                logger.error(f"Error during message purge in guild {interaction.guild.id}: {e}", exc_info=True)
-                # Use the purge_interaction to send the error
-                await purge_interaction.followup.send(STRINGS["db_error"], ephemeral=True)
-
-        # 3. Handle confirmation flow
-        if amount > 100:
-            confirm_view = ConfirmationView()
-            # Use the modal interaction to send the confirmation message
-            await interaction.response.send_message(f"You are about to delete up to {amount} messages. Are you sure?", view=confirm_view, ephemeral=True)
-            await confirm_view.wait()
-
-            if confirm_view.value:
-                # If confirmed, use the deferred button interaction to start the purge
-                await do_purge(confirm_view.interaction)
-            # If cancelled, the view handles the response itself.
-        else:
-            # No confirmation needed, defer the modal interaction and start the purge
-            await interaction.response.defer(ephemeral=True)
-            await do_purge(interaction)
+                uid = int(m.group(1))
+            except Exception:
+                uid = None
+        if uid is None:
+            return await _safe_ephemeral(interaction, "Could not parse a valid user ID or mention.")
+        try:
+            n = max(1, min(1000, int(str(self.count))))
+        except ValueError:
+            return await _safe_ephemeral(interaction, "Enter a whole number between 1 and 1000.")
+        await self._cb(interaction, uid, n)
 
 
-# --- Confirmation View (CORRECTED) ---
-class ConfirmationView(View):
-    def __init__(self):
-        super().__init__(timeout=60)
-        self.value = None
-        self.interaction: Optional[discord.Interaction] = None
+class CountAndQueryModal(discord.ui.Modal, title="Purge contains"):
+    query = discord.ui.TextInput(label="Keyword / phrase", placeholder="spam.com", required=True, max_length=100)
+    count = discord.ui.TextInput(label="Count (1–1000)", placeholder="100", required=True, max_length=4)
 
-    @discord.ui.button(label="Confirm", style=discord.ButtonStyle.danger)
-    async def confirm(self, interaction: discord.Interaction, button: Button):
-        self.value = True
-        self.interaction = interaction
-        # Disable buttons to prevent double-clicks
-        for item in self.children:
-            item.disabled = True
-        # Defer the interaction instead of editing. The caller will handle the response.
-        await interaction.response.defer()
-        self.stop()
+    def __init__(self, on_submit_cb: Callable[[discord.Interaction, str, int], Awaitable[None]]):
+        super().__init__(timeout=None)
+        self._cb = on_submit_cb
 
-    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
-    async def cancel(self, interaction: discord.Interaction, button: Button):
-        self.value = False
-        self.interaction = interaction
-        for item in self.children:
-            item.disabled = True
-        # Respond directly here since it's a final action.
-        await interaction.response.edit_message(content="❌ Purge cancelled.", view=None)
-        self.stop()
+    async def on_submit(self, interaction: discord.Interaction):
+        q = str(self.query).strip().lower()
+        if not q:
+            return await _safe_ephemeral(interaction, "Enter a keyword.")
+        try:
+            n = max(1, min(1000, int(str(self.count))))
+        except ValueError:
+            return await _safe_ephemeral(interaction, "Enter a whole number between 1 and 1000.")
+        await self._cb(interaction, q, n)
 
-# --- Purge Settings View ---
 
-class PurgeSettingsView(BaseSettingsView):
-    """The settings menu for the message purging feature."""
+# ----------------- View -----------------
+
+class PurgePanelView(discord.ui.View):
     def __init__(self, bot: commands.Bot):
-        super().__init__(bot)
+        super().__init__(timeout=None)
+        self.bot = bot
 
-        back_button = Button(label="◀️ Back to Staff Menu", style=discord.ButtonStyle.primary, custom_id="purge:nav_staff_main")
-        back_button.callback = self.go_to_staff_main
-        self.add_item(back_button)
+    # ------- Buttons -------
+    @discord.ui.button(label="Purge Recent", style=discord.ButtonStyle.primary, custom_id="op:purge:recent")
+    async def purge_recent(self, interaction: discord.Interaction, _: discord.ui.Button):
+        if not admin_only(interaction):
+            return await _safe_ephemeral(interaction, "Admins only.")
+        async def run(inter: discord.Interaction, n: int):
+            await _purge_with_filter(inter, n, lambda m: True)
+        await interaction.response.send_modal(CountOnlyModal(run))
 
-        purge_user_button = Button(label="Purge by User", emoji="👤", custom_id="purge:user")
-        purge_user_button.callback = self.purge_user
-        self.add_item(purge_user_button)
+    @discord.ui.button(label="Purge By User", style=discord.ButtonStyle.secondary, custom_id="op:purge:user")
+    async def purge_user(self, interaction: discord.Interaction, _: discord.ui.Button):
+        if not admin_only(interaction):
+            return await _safe_ephemeral(interaction, "Admins only.")
+        async def run(inter: discord.Interaction, uid: int, n: int):
+            await _purge_with_filter(inter, n, lambda m: m.author and m.author.id == uid)
+        await interaction.response.send_modal(CountAndUserModal(run))
 
-        purge_advanced_button = Button(label="Advanced Purge", emoji="⚙️", custom_id="purge:advanced")
-        purge_advanced_button.callback = self.purge_advanced
-        self.add_item(purge_advanced_button)
+    @discord.ui.button(label="Purge Contains", style=discord.ButtonStyle.secondary, custom_id="op:purge:contains")
+    async def purge_contains(self, interaction: discord.Interaction, _: discord.ui.Button):
+        if not admin_only(interaction):
+            return await _safe_ephemeral(interaction, "Admins only.")
+        async def run(inter: discord.Interaction, q: str, n: int):
+            ql = q.lower()
+            await _purge_with_filter(inter, n, lambda m: (m.content or "").lower().find(ql) != -1)
+        await interaction.response.send_modal(CountAndQueryModal(run))
 
-    async def go_to_staff_main(self, interaction: discord.Interaction):
-        """Returns to the main staff menu."""
-        from .menu_cog import StaffMenuView
-        embed = create_embed("🛡️ Staff Menu", "Select a category to configure.", discord.Color.blue())
-        view = StaffMenuView(self.bot)
-        await interaction.response.edit_message(embed=embed, view=view)
-        view.message = await interaction.original_response()
+    @discord.ui.button(label="Purge Links", style=discord.ButtonStyle.secondary, custom_id="op:purge:links")
+    async def purge_links(self, interaction: discord.Interaction, _: discord.ui.Button):
+        if not admin_only(interaction):
+            return await _safe_ephemeral(interaction, "Admins only.")
+        url_regex = re.compile(r"https?://|discord\.gg/|www\.", re.I)
+        async def run(inter: discord.Interaction, n: int):
+            await _purge_with_filter(inter, n, lambda m: bool(url_regex.search(m.content or "")))
+        await interaction.response.send_modal(CountOnlyModal(run))
 
-    async def purge_user(self, interaction: discord.Interaction):
-        """Opens a view to select a user to purge messages from."""
-        view = View(timeout=180)
-        user_select = UserSelect(placeholder="Select a user...")
+    @discord.ui.button(label="Purge Bots", style=discord.ButtonStyle.secondary, custom_id="op:purge:bots")
+    async def purge_bots(self, interaction: discord.Interaction, _: discord.ui.Button):
+        if not admin_only(interaction):
+            return await _safe_ephemeral(interaction, "Admins only.")
+        async def run(inter: discord.Interaction, n: int):
+            await _purge_with_filter(inter, n, lambda m: getattr(m.author, 'bot', False))
+        await interaction.response.send_modal(CountOnlyModal(run))
 
-        async def user_select_callback(select_interaction: discord.Interaction):
-            target_user = user_select.values[0]
-            await select_interaction.response.send_modal(PurgeFilterModal(self.bot, target_user))
-
-        async def on_timeout():
+    @discord.ui.button(label="Back", style=discord.ButtonStyle.danger, custom_id="op:purge:back")
+    async def back(self, interaction: discord.Interaction, _: discord.ui.Button):
+        from cogs.menu_cog import MainMenuView, build_main_embed
+        try:
+            await interaction.response.edit_message(embed=build_main_embed(interaction.guild), view=MainMenuView(self.bot))
+        except Exception:
             try:
-                await interaction.edit_original_response(content="❌ User selection timed out. Please try again.", view=None)
-            except discord.NotFound:
-                logger.warning("Original interaction not found during timeout handling.")
+                await interaction.edit_original_response(embed=build_main_embed(interaction.guild), view=MainMenuView(self.bot))
+            except Exception:
+                pass
 
-        view.on_timeout = on_timeout
-        user_select.callback = user_select_callback
-        view.add_item(user_select)
-        await interaction.response.send_message("Please select the user whose messages you want to purge:", view=view, ephemeral=True)
 
-    async def purge_advanced(self, interaction: discord.Interaction):
-        """Opens a modal for advanced purge options."""
-        await interaction.response.send_modal(PurgeFilterModal(self.bot))
+# ----------------- Core purge logic -----------------
 
-# --- Cog Loader ---
+async def _purge_with_filter(interaction: discord.Interaction, target_count: int, pred: Callable[[discord.Message], bool]):
+    # Permission checks
+    if not interaction.guild:
+        return await _safe_ephemeral(interaction, "Guild-only action.")
+    if not isinstance(interaction.user, discord.Member) or not interaction.user.guild_permissions.administrator:
+        return await _safe_ephemeral(interaction, "Admins only.")
+    if not isinstance(interaction.channel, discord.TextChannel):
+        return await _safe_ephemeral(interaction, "This isn’t a text channel.")
+    me_perms = interaction.channel.permissions_for(interaction.guild.me)
+    if not me_perms.manage_messages:
+        return await _safe_ephemeral(interaction, "I need the **Manage Messages** permission here.")
+
+    await _safe_ephemeral(interaction, "Working… (this can take a moment for older messages)")
+
+    deleted = 0
+    scanned = 0
+    # We scan up to ~5000 recent messages to find matches, but stop once we delete target_count
+    async for msg in interaction.channel.history(limit=5000):
+        scanned += 1
+        if pred(msg):
+            try:
+                await msg.delete()
+                deleted += 1
+            except discord.Forbidden:
+                pass
+            except Exception:
+                pass
+            if deleted >= target_count:
+                break
+
+    await _safe_ephemeral(interaction, f"Purged {deleted} message(s). Scanned {scanned}.)")
+
+
+# ----------------- Helpers -----------------
+
+async def _safe_ephemeral(interaction: discord.Interaction, content: str):
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(content, ephemeral=True)
+        else:
+            await interaction.response.send_message(content, ephemeral=True)
+    except Exception:
+        pass
+
+
+# ----------------- Cog -----------------
+
 class PurgeCog(commands.Cog):
-    """A cog for handling message purging."""
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+
+    async def cog_load(self) -> None:
+        try:
+            self.bot.add_view(PurgePanelView(self.bot))
+        except Exception:
+            pass
+
 
 async def setup(bot: commands.Bot):
-    """Adds the cog to the bot."""
     await bot.add_cog(PurgeCog(bot))
+    try:
+        bot.add_view(PurgePanelView(bot))
+    except Exception:
+        pass

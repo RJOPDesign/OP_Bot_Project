@@ -1,277 +1,334 @@
+"""
+Logging cog — menu-only configuration and event logging.
+
+Features
+- Toggle logging on/off per guild
+- Pick a log channel
+- Toggle individual events: message delete/edit, member join/leave
+- Persistent buttons with stable custom_ids
+- Mongo-backed persistence if `bot.db` is available (collection: `configs`)
+- Safe interaction handling to avoid "Interaction Failed"
+
+Integrations
+- utils.mk_embed, utils.admin_only, utils.ensure_guild_config
+"""
+from __future__ import annotations
+
+from typing import Dict, Any, Optional, List
+import datetime as dt
+
 import discord
-from discord import app_commands
 from discord.ext import commands
-from discord.ui import View, Button, Select, ChannelSelect as DiscordChannelSelect
-import datetime
-import logging
 
-# Import from the utils cog for consistency
-from .utils import BaseSettingsView, create_embed, STRINGS
+from utils import mk_embed, admin_only, ensure_guild_config
 
-logger = logging.getLogger(__name__)
 
-# --- UI Views ---
+DEFAULT_EVENTS = {
+    "message_delete": True,
+    "message_edit": True,
+    "member_join": True,
+    "member_leave": True,
+}
 
-class LogEventSelect(Select):
-    def __init__(self, bot: commands.Bot, guild_config: dict):
+
+# --------------- storage helpers ---------------
+async def get_log_config(bot: commands.Bot, guild_id: int) -> Dict[str, Any]:
+    cfg = await ensure_guild_config(bot, guild_id)
+    log_cfg = cfg.get("logging") or {}
+    # normalize shape
+    return {
+        "enabled": bool(log_cfg.get("enabled", True)),
+        "channel_id": log_cfg.get("channel_id"),
+        "events": {**DEFAULT_EVENTS, **(log_cfg.get("events") or {})},
+    }
+
+
+async def save_log_config(bot: commands.Bot, guild_id: int, new_cfg: Dict[str, Any]):
+    # merge into root configs.logging
+    base = await ensure_guild_config(bot, guild_id)
+    merged = {
+        **base,
+        "logging": {
+            "enabled": bool(new_cfg.get("enabled", True)),
+            "channel_id": new_cfg.get("channel_id"),
+            "events": {**DEFAULT_EVENTS, **(new_cfg.get("events") or {})},
+        },
+    }
+    if getattr(bot, "db", None):
+        await bot.db["configs"].update_one({"guild_id": guild_id}, {"$set": merged}, upsert=True)
+    else:
+        # memory fallback (non-persistent)
+        store = bot.__dict__.setdefault("_mem_configs", {})
+        store[guild_id] = merged
+
+
+# --------------- embed ---------------
+async def build_logging_embed_async(guild: discord.Guild, bot: commands.Bot) -> discord.Embed:
+    cfg = await get_log_config(bot, guild.id)
+    ch_text = f"<#{cfg['channel_id']}>" if cfg.get("channel_id") else "Not set"
+    ev = cfg.get("events", {})
+    lines = [
+        f"**Status:** {'ON' if cfg.get('enabled') else 'OFF'}",
+        f"**Channel:** {ch_text}",
+        "**Events:**",
+        f"• Message Delete: {'✅' if ev.get('message_delete') else '❌'}",
+        f"• Message Edit: {'✅' if ev.get('message_edit') else '❌'}",
+        f"• Member Join: {'✅' if ev.get('member_join') else '❌'}",
+        f"• Member Leave: {'✅' if ev.get('member_leave') else '❌'}",
+    ]
+    return mk_embed("Logging Settings", "\n".join(lines))
+
+
+def build_logging_embed(guild: discord.Guild) -> discord.Embed:
+    # Synchronous placeholder (main menu can call this; view will refresh with async details)
+    return mk_embed("Logging Settings", "Loading…")
+
+
+# --------------- views ---------------
+class LoggingSettingsView(discord.ui.View):
+    def __init__(self, bot: commands.Bot):
+        super().__init__(timeout=None)
         self.bot = bot
-        log_config = guild_config.get("logging", {})
-        current_events = log_config.get("enabled_events", [])
-        options = [
-            discord.SelectOption(label="Message Deletions", value="message_delete", default="message_delete" in current_events),
-            discord.SelectOption(label="Message Edits", value="message_edit", default="message_edit" in current_events),
-            discord.SelectOption(label="Member Joins", value="member_join", default="member_join" in current_events),
-            discord.SelectOption(label="Member Leaves", value="member_leave", default="member_leave" in current_events),
-            discord.SelectOption(label="Member Bans", value="member_ban", default="member_ban" in current_events),
-            discord.SelectOption(label="Member Unbans", value="member_unban", default="member_unban" in current_events),
-            discord.SelectOption(label="Nickname Changes", value="member_nick_update", default="member_nick_update" in current_events),
-            discord.SelectOption(label="Role Updates", value="member_role_update", default="member_role_update" in current_events),
-            discord.SelectOption(label="Channel Events", value="channel_events", default="channel_events" in current_events),
-        ]
-        super().__init__(placeholder="Select events to log...", min_values=0, max_values=len(options), options=options, custom_id="log_event_selector")
 
-    async def callback(self, interaction: discord.Interaction) -> None:
+    async def _refresh_embed(self, interaction: discord.Interaction):
+        e = await build_logging_embed_async(interaction.guild, self.bot)
         try:
-            await self.bot.db.configs.update_one({"guild_id": interaction.guild.id}, {"$set": {"logging.enabled_events": self.values}}, upsert=True)
-            await interaction.response.send_message(f"✅ Log events updated! Now logging **{len(self.values)}** types of events.", ephemeral=True)
-        except Exception as e:
-            logger.error(f"DB update failed for guild {interaction.guild.id}: {e}")
-            await interaction.response.send_message(STRINGS.get("db_error", "A database error occurred."), ephemeral=True)
+            if interaction.response.is_done():
+                await interaction.edit_original_response(embed=e, view=self)
+            else:
+                await interaction.response.edit_message(embed=e, view=self)
+        except Exception:
+            pass
 
-class LoggingSettingsView(BaseSettingsView):
-    def __init__(self, bot: commands.Bot, guild_id: int, config: dict):
-        super().__init__(bot)
-        self.guild_id = guild_id
-        self.config = config
-        log_config = self.config.get("logging", {})
-        is_enabled = log_config.get("enabled", False)
-        
-        back_button = Button(label="◀️ Back", custom_id="logging:nav_staff")
-        back_button.callback = self.go_to_staff_menu
-        self.add_item(back_button)
+    # --- Toggle on/off ---
+    @discord.ui.button(label="Toggle On/Off", style=discord.ButtonStyle.primary, custom_id="op:log:toggle")
+    async def toggle(self, interaction: discord.Interaction, _: discord.ui.Button):
+        if not admin_only(interaction):
+            return await _safe_ephemeral(interaction, "Admins only.")
+        cfg = await get_log_config(self.bot, interaction.guild.id)
+        cfg["enabled"] = not cfg.get("enabled", True)
+        await save_log_config(self.bot, interaction.guild.id, cfg)
+        await _safe_ephemeral(interaction, f"Logging turned {'ON' if cfg['enabled'] else 'OFF'}.")
+        await self._refresh_embed(interaction)
 
-        toggle_button = Button(label=f"Logging is {'ON' if is_enabled else 'OFF'}", style=discord.ButtonStyle.green if is_enabled else discord.ButtonStyle.red, custom_id="logging:toggle")
-        toggle_button.callback = self.toggle_logging
-        self.add_item(toggle_button)
+    # --- Set channel ---
+    @discord.ui.button(label="Set Channel", style=discord.ButtonStyle.secondary, custom_id="op:log:channel")
+    async def set_channel(self, interaction: discord.Interaction, _: discord.ui.Button):
+        if not admin_only(interaction):
+            return await _safe_ephemeral(interaction, "Admins only.")
+        await _present_channel_picker(self.bot, interaction)
 
-        channel_select = DiscordChannelSelect(placeholder="Select a log channel...", custom_id="logging:set_channel")
-        channel_select.callback = self.set_log_channel
-        self.add_item(channel_select)
-        
-        self.add_item(LogEventSelect(self.bot, self.config))
+    # --- Toggle events ---
+    @discord.ui.button(label="Toggle Events", style=discord.ButtonStyle.secondary, custom_id="op:log:events")
+    async def toggle_events(self, interaction: discord.Interaction, _: discord.ui.Button):
+        if not admin_only(interaction):
+            return await _safe_ephemeral(interaction, "Admins only.")
+        await _present_event_picker(self.bot, interaction)
 
-    async def go_to_staff_menu(self, interaction: discord.Interaction) -> None:
-        from .menu_cog import StaffMenuView
-        embed = create_embed("🛡️ Staff Menu", "Select a category to configure.", discord.Color.blue())
-        await interaction.response.edit_message(embed=embed, view=StaffMenuView(self.bot))
-
-    async def toggle_logging(self, interaction: discord.Interaction) -> None:
-        new_status = not self.config.get("logging", {}).get("enabled", False)
-        await self.bot.db.configs.update_one({"guild_id": self.guild_id}, {"$set": {"logging.enabled": new_status}}, upsert=True)
-        config = await self.bot.get_guild_config(self.guild_id)
-        view = LoggingSettingsView(self.bot, self.guild_id, config)
-        await interaction.response.edit_message(view=view)
-        view.message = await interaction.original_response()
-        await interaction.followup.send(f"✅ Logging turned {'ON' if new_status else 'OFF'}.", ephemeral=True)
-
-    async def set_log_channel(self, interaction: discord.Interaction):
-        channel_id = int(interaction.data["values"][0])
-        await self.bot.db.configs.update_one({"guild_id": self.guild_id}, {"$set": {"logging.log_channel_id": channel_id}}, upsert=True)
-        await interaction.response.send_message(f"✅ Log channel set to <#{channel_id}>!", ephemeral=True)
+    # --- Back ---
+    @discord.ui.button(label="Back", style=discord.ButtonStyle.danger, custom_id="op:log:back")
+    async def back(self, interaction: discord.Interaction, _: discord.ui.Button):
+        from cogs.menu_cog import MainMenuView, build_main_embed
+        try:
+            await interaction.response.edit_message(embed=build_main_embed(interaction.guild), view=MainMenuView(self.bot))
+        except Exception:
+            try:
+                await interaction.edit_original_response(embed=build_main_embed(interaction.guild), view=MainMenuView(self.bot))
+            except Exception:
+                pass
 
 
-# --- Main Cog ---
+class LogChannelSelect(discord.ui.ChannelSelect):
+    def __init__(self):
+        super().__init__(channel_types=[discord.ChannelType.text], placeholder="Pick a log channel…", min_values=1, max_values=1, custom_id="op:log:pickchan")
 
+
+class LogEventsSelect(discord.ui.Select):
+    def __init__(self, current: Dict[str, bool]):
+        opts = [
+            discord.SelectOption(label="Message Delete", value="message_delete", default=current.get("message_delete", True)),
+            discord.SelectOption(label="Message Edit", value="message_edit", default=current.get("message_edit", True)),
+            discord.SelectOption(label="Member Join", value="member_join", default=current.get("member_join", True)),
+            discord.SelectOption(label="Member Leave", value="member_leave", default=current.get("member_leave", True)),
+        ]
+        super().__init__(placeholder="Toggle events (select those to ENABLE)", min_values=0, max_values=len(opts), options=opts, custom_id="op:log:pickevents")
+
+
+class LogChannelPickView(discord.ui.View):
+    def __init__(self, bot: commands.Bot):
+        super().__init__(timeout=60)
+        self.bot = bot
+        self.add_item(LogChannelSelect())
+
+    @discord.ui.button(label="Save", style=discord.ButtonStyle.primary, custom_id="op:log:savechan")
+    async def save(self, interaction: discord.Interaction, _: discord.ui.Button):
+        if not admin_only(interaction):
+            return await _safe_ephemeral(interaction, "Admins only.")
+        sel: LogChannelSelect = next((c for c in self.children if isinstance(c, LogChannelSelect)), None)
+        if not sel or not sel.values:
+            return await _safe_ephemeral(interaction, "Select a channel first.")
+        channel_id = int(sel.values[0])
+        cfg = await get_log_config(self.bot, interaction.guild.id)
+        cfg["channel_id"] = channel_id
+        await save_log_config(self.bot, interaction.guild.id, cfg)
+        await _safe_ephemeral(interaction, f"Log channel set to <#{channel_id}>.")
+        # Close picker and refresh parent message if possible
+        await _refresh_parent_logging_embed(self.bot, interaction)
+
+
+class LogEventsPickView(discord.ui.View):
+    def __init__(self, bot: commands.Bot, current: Dict[str, bool]):
+        super().__init__(timeout=60)
+        self.bot = bot
+        self.add_item(LogEventsSelect(current))
+
+    @discord.ui.button(label="Save", style=discord.ButtonStyle.primary, custom_id="op:log:saveevents")
+    async def save(self, interaction: discord.Interaction, _: discord.ui.Button):
+        if not admin_only(interaction):
+            return await _safe_ephemeral(interaction, "Admins only.")
+        sel: LogEventsSelect = next((c for c in self.children if isinstance(c, LogEventsSelect)), None)
+        values = set(sel.values) if sel else set()
+        # Selected are enabled
+        cfg = await get_log_config(self.bot, interaction.guild.id)
+        cfg_events = {k: (k in values) for k in DEFAULT_EVENTS.keys()}
+        cfg["events"] = cfg_events
+        await save_log_config(self.bot, interaction.guild.id, cfg)
+        await _safe_ephemeral(interaction, "Logging events updated.")
+        await _refresh_parent_logging_embed(self.bot, interaction)
+
+
+async def _present_channel_picker(bot: commands.Bot, interaction: discord.Interaction):
+    try:
+        await interaction.response.send_message("Select a log channel:", view=LogChannelPickView(bot), ephemeral=True)
+    except Exception:
+        pass
+
+
+async def _present_event_picker(bot: commands.Bot, interaction: discord.Interaction):
+    cfg = await get_log_config(bot, interaction.guild.id)
+    try:
+        await interaction.response.send_message("Toggle events to enable:", view=LogEventsPickView(bot, cfg.get("events", {})), ephemeral=True)
+    except Exception:
+        pass
+
+
+async def _refresh_parent_logging_embed(bot: commands.Bot, interaction: discord.Interaction):
+    # Tries to find the last message with LoggingSettingsView in the channel and refresh it.
+    try:
+        async for msg in interaction.channel.history(limit=20):
+            if msg.author.id == bot.user.id and isinstance(msg.components, list):
+                # best-effort: just try editing with a fresh view
+                e = await build_logging_embed_async(interaction.guild, bot)
+                try:
+                    await msg.edit(embed=e, view=LoggingSettingsView(bot))
+                except Exception:
+                    pass
+                break
+    except Exception:
+        pass
+
+
+async def _safe_ephemeral(interaction: discord.Interaction, content: str):
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(content, ephemeral=True)
+        else:
+            await interaction.response.send_message(content, ephemeral=True)
+    except Exception:
+        pass
+
+
+# --------------- Cog ---------------
 class LoggingCog(commands.Cog):
-    """A cog for logging various server events to a designated channel."""
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
-    async def _send_log(self, guild_id: int, event_name: str, embed: discord.Embed):
-        """A robust helper function to check configuration and send a log message."""
+    async def cog_load(self) -> None:
+        # Ensure persistent settings view is registered for restarts
         try:
-            config = await self.bot.get_guild_config(guild_id)
-            if not config:
-                logger.warning(f"No config found for guild {guild_id} in _send_log")
-                return
-        except Exception as e:
-            logger.error(f"Error fetching guild config for {guild_id}: {e}")
-            return
+            self.bot.add_view(LoggingSettingsView(self.bot))
+        except Exception:
+            pass
 
-        log_config = config.get("logging", {})
-        
-        if not log_config.get("enabled") or event_name not in log_config.get("enabled_events", []):
-            return
-            
-        log_channel_id = log_config.get("log_channel_id")
-        if not log_channel_id:
-            return
-            
-        log_channel = self.bot.get_channel(log_channel_id)
-        if not log_channel or not isinstance(log_channel, discord.TextChannel):
-            logger.warning(f"Log channel {log_channel_id} not found or is not a text channel in guild {guild_id}.")
-            return
-
-        guild = self.bot.get_guild(guild_id)
-        if not guild: return
-
-        required_perms = discord.Permissions(send_messages=True, embed_links=True)
-        if not log_channel.permissions_for(guild.me).is_superset(required_perms):
-            logger.warning(f"Missing permissions (Send Messages, Embed Links) in log channel {log_channel_id} for guild {guild_id}.")
-            return
-
-        try:
-            await log_channel.send(embed=embed)
-        except discord.Forbidden:
-            logger.error(f"Forbidden to send log to channel {log_channel_id} in guild {guild_id}.")
-        except discord.HTTPException as e:
-            logger.error(f"HTTP error sending log to channel {log_channel_id}: {e}")
-        except Exception as e:
-            logger.error(f"An unexpected error occurred in _send_log for guild {guild_id}: {e}")
-
+    # --- Event handlers ---
     @commands.Cog.listener()
     async def on_message_delete(self, message: discord.Message):
-        """Logs when a message is deleted."""
         if not message.guild or message.author.bot:
             return
-
-        embed = discord.Embed(
-            color=discord.Color.red(),
-            description=f"**Message sent by {message.author.mention} deleted in {message.channel.mention}**",
-            timestamp=datetime.datetime.now(datetime.timezone.utc)
-        )
+        cfg = await get_log_config(self.bot, message.guild.id)
+        if not cfg.get("enabled") or not cfg["events"].get("message_delete"):
+            return
+        ch = message.guild.get_channel(cfg.get("channel_id") or 0)
+        if not isinstance(ch, discord.TextChannel):
+            return
+        e = discord.Embed(title="🗑️ Message Deleted", color=discord.Color.red(), timestamp=dt.datetime.utcnow())
+        e.add_field(name="Author", value=f"{message.author} ({message.author.id})", inline=False)
+        e.add_field(name="Channel", value=message.channel.mention)
         if message.content:
-            embed.add_field(name="Content", value=f"```{message.content[:1020]}```", inline=False)
-        embed.set_author(name=str(message.author), icon_url=message.author.display_avatar.url)
-        embed.set_footer(text=f"Author ID: {message.author.id} | Message ID: {message.id}")
-        await self._send_log(message.guild.id, "message_delete", embed)
+            e.add_field(name="Content", value=(message.content[:1024]), inline=False)
+        e.set_footer(text=f"Message ID: {message.id}")
+        try:
+            await ch.send(embed=e)
+        except Exception:
+            pass
 
     @commands.Cog.listener()
     async def on_message_edit(self, before: discord.Message, after: discord.Message):
-        """Logs when a message is edited."""
-        if not before.guild or before.author.bot or before.content == after.content:
+        if not after.guild or after.author.bot:
             return
-
-        embed = discord.Embed(
-            color=discord.Color.orange(),
-            description=f"**Message edited in {before.channel.mention}** [Jump to Message]({after.jump_url})",
-            timestamp=datetime.datetime.now(datetime.timezone.utc)
-        )
+        if before.content == after.content:
+            return
+        cfg = await get_log_config(self.bot, after.guild.id)
+        if not cfg.get("enabled") or not cfg["events"].get("message_edit"):
+            return
+        ch = after.guild.get_channel(cfg.get("channel_id") or 0)
+        if not isinstance(ch, discord.TextChannel):
+            return
+        e = discord.Embed(title="✏️ Message Edited", color=discord.Color.orange(), timestamp=dt.datetime.utcnow())
+        e.add_field(name="Author", value=f"{after.author} ({after.author.id})", inline=False)
+        e.add_field(name="Channel", value=after.channel.mention)
         if before.content:
-            embed.add_field(name="Before", value=f"```{before.content[:1020]}```", inline=False)
+            e.add_field(name="Before", value=before.content[:1024], inline=False)
         if after.content:
-            embed.add_field(name="After", value=f"```{after.content[:1020]}```", inline=False)
-        embed.set_author(name=str(before.author), icon_url=before.author.display_avatar.url)
-        embed.set_footer(text=f"Author ID: {before.author.id} | Message ID: {before.id}")
-        await self._send_log(before.guild.id, "message_edit", embed)
+            e.add_field(name="After", value=after.content[:1024], inline=False)
+        e.set_footer(text=f"Message ID: {after.id}")
+        try:
+            await ch.send(embed=e)
+        except Exception:
+            pass
 
     @commands.Cog.listener()
     async def on_member_join(self, member: discord.Member):
-        """Logs when a member joins the server."""
-        embed = discord.Embed(
-            color=discord.Color.green(),
-            description=f"{member.mention} **joined the server**",
-            timestamp=datetime.datetime.now(datetime.timezone.utc)
-        )
-        embed.set_author(name=str(member), icon_url=member.display_avatar.url)
-        embed.add_field(name="Account Created", value=discord.utils.format_dt(member.created_at, style='R'))
-        embed.set_footer(text=f"User ID: {member.id}")
-        await self._send_log(member.guild.id, "member_join", embed)
+        cfg = await get_log_config(self.bot, member.guild.id)
+        if not cfg.get("enabled") or not cfg["events"].get("member_join"):
+            return
+        ch = member.guild.get_channel(cfg.get("channel_id") or 0)
+        if not isinstance(ch, discord.TextChannel):
+            return
+        e = discord.Embed(title="➕ Member Joined", description=f"{member.mention} ({member.id})", color=discord.Color.green(), timestamp=dt.datetime.utcnow())
+        try:
+            await ch.send(embed=e)
+        except Exception:
+            pass
 
     @commands.Cog.listener()
     async def on_member_remove(self, member: discord.Member):
-        """Logs when a member leaves the server."""
-        embed = discord.Embed(
-            color=discord.Color.dark_red(),
-            description=f"{member.mention} **left the server**",
-            timestamp=datetime.datetime.now(datetime.timezone.utc)
-        )
-        embed.set_author(name=str(member), icon_url=member.display_avatar.url)
-        embed.set_footer(text=f"User ID: {member.id}")
-        await self._send_log(member.guild.id, "member_leave", embed)
+        cfg = await get_log_config(self.bot, member.guild.id)
+        if not cfg.get("enabled") or not cfg["events"].get("member_leave"):
+            return
+        ch = member.guild.get_channel(cfg.get("channel_id") or 0)
+        if not isinstance(ch, discord.TextChannel):
+            return
+        e = discord.Embed(title="➖ Member Left", description=f"{member} ({member.id})", color=discord.Color.dark_grey(), timestamp=dt.datetime.utcnow())
+        try:
+            await ch.send(embed=e)
+        except Exception:
+            pass
 
-    @commands.Cog.listener()
-    async def on_member_ban(self, guild: discord.Guild, user: discord.User):
-        """Logs when a member is banned."""
-        embed = discord.Embed(
-            color=discord.Color.from_rgb(0,0,0),
-            description=f"{user.mention} **was banned from the server**",
-            timestamp=datetime.datetime.now(datetime.timezone.utc)
-        )
-        embed.set_author(name=str(user), icon_url=user.display_avatar.url)
-        embed.set_footer(text=f"User ID: {user.id}")
-        await self._send_log(guild.id, "member_ban", embed)
-        
-    @commands.Cog.listener()
-    async def on_member_unban(self, guild: discord.Guild, user: discord.User):
-        """Logs when a member is unbanned."""
-        embed = discord.Embed(
-            color=discord.Color.from_rgb(173, 216, 230),
-            description=f"{user.mention} **was unbanned from the server**",
-            timestamp=datetime.datetime.now(datetime.timezone.utc)
-        )
-        embed.set_author(name=str(user), icon_url=user.display_avatar.url)
-        embed.set_footer(text=f"User ID: {user.id}")
-        await self._send_log(guild.id, "member_unban", embed)
-
-    @commands.Cog.listener()
-    async def on_member_update(self, before: discord.Member, after: discord.Member):
-        """Logs nickname and role changes."""
-        # Nickname changes
-        if before.nick != after.nick:
-            embed = discord.Embed(
-                color=discord.Color.blue(),
-                description=f"**{after.mention}'s nickname was changed**",
-                timestamp=datetime.datetime.now(datetime.timezone.utc)
-            )
-            embed.add_field(name="Before", value=before.nick or "None", inline=False)
-            embed.add_field(name="After", value=after.nick or "None", inline=False)
-            embed.set_author(name=str(after), icon_url=after.display_avatar.url)
-            embed.set_footer(text=f"User ID: {after.id}")
-            await self._send_log(after.guild.id, "member_nick_update", embed)
-        
-        # Role changes
-        if before.roles != after.roles:
-            added_roles = [r.mention for r in after.roles if r not in before.roles]
-            removed_roles = [r.mention for r in before.roles if r not in after.roles]
-            if not added_roles and not removed_roles: return
-            
-            embed = discord.Embed(
-                color=discord.Color.purple(),
-                description=f"**{after.mention}'s roles were updated**",
-                timestamp=datetime.datetime.now(datetime.timezone.utc)
-            )
-            # Truncate role lists to prevent exceeding embed limits
-            if added_roles:
-                embed.add_field(name="Added Roles", value=", ".join(added_roles)[:1020], inline=False)
-            if removed_roles:
-                embed.add_field(name="Removed Roles", value=", ".join(removed_roles)[:1020], inline=False)
-            embed.set_author(name=str(after), icon_url=after.display_avatar.url)
-            embed.set_footer(text=f"User ID: {after.id}")
-            await self._send_log(after.guild.id, "member_role_update", embed)
-
-    @commands.Cog.listener()
-    async def on_guild_channel_create(self, channel: discord.abc.GuildChannel):
-        """Logs when a channel is created."""
-        embed = discord.Embed(
-            color=discord.Color.teal(),
-            description=f"**Channel Created: #{channel.name}**",
-            timestamp=datetime.datetime.now(datetime.timezone.utc)
-        )
-        embed.set_footer(text=f"Channel ID: {channel.id}")
-        await self._send_log(channel.guild.id, "channel_events", embed)
-        
-    @commands.Cog.listener()
-    async def on_guild_channel_delete(self, channel: discord.abc.GuildChannel):
-        """Logs when a channel is deleted."""
-        embed = discord.Embed(
-            color=discord.Color.dark_teal(),
-            description=f"**Channel Deleted: #{channel.name}**",
-            timestamp=datetime.datetime.now(datetime.timezone.utc)
-        )
-        embed.set_footer(text=f"Channel ID: {channel.id}")
-        await self._send_log(channel.guild.id, "channel_events", embed)
 
 async def setup(bot: commands.Bot):
-    """Adds the cog to the bot."""
     await bot.add_cog(LoggingCog(bot))
+    try:
+        bot.add_view(LoggingSettingsView(bot))
+    except Exception:
+        pass

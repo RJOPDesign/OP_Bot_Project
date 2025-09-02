@@ -1,153 +1,149 @@
+"""
+Main menu cog — central hub for all panels.
+
+Features
+- A single persistent main control panel message (per channel) with buttons to sub-panels:
+  • Moderation
+  • Logging
+  • Tickets (Public + Settings)
+  • Giveaways
+  • Purge Tools
+  • Music
+  • Essentials (ping/uptime, post panel, reload views)
+- Admin-gated entry; buttons swap the same message to the selected panel embed+view
+- Stable custom_ids so views persist across restarts
+- Helper `build_main_embed(guild)` used by other cogs when returning to menu
+"""
+from __future__ import annotations
+
+from typing import Optional
+
 import discord
-from discord import app_commands
 from discord.ext import commands
-from discord.ui import View, Button, Modal, TextInput
-import logging
 
-# Import from the utils cog for consistency
-from .utils import BaseSettingsView, create_embed, STRINGS
-# Import views from other cogs for navigation
-from .music_cog import MusicPlayerView
+from utils import mk_embed, admin_only
 
-logger = logging.getLogger(__name__)
 
-# --- Main Navigation Views ---
+# ----------------- Main embed -----------------
 
-class StaffMenuView(BaseSettingsView):
-    """The main menu for core staff features."""
+def build_main_embed(guild: discord.Guild) -> discord.Embed:
+    desc = (
+        "Use the buttons below to open a panel.\n\n"
+        "• Moderation — timeout, kick, ban, unban, purge\n"
+        "• Logging — configure log channel & events\n"
+        "• Tickets — open/close tickets and settings\n"
+        "• Giveaways — create and manage giveaways\n"
+        "• Purge Tools — advanced message cleanup\n"
+        "• Music — YouTube playback (modal + queue)\n"
+        "• Essentials — uptime, ping, post panel, reload views"
+    )
+    return mk_embed(f"OP Bot • {guild.name}", desc)
+
+
+# ----------------- View -----------------
+
+class MainMenuView(discord.ui.View):
     def __init__(self, bot: commands.Bot):
-        super().__init__(bot)
-        
-        back_button = Button(label="◀️ Back to Main Menu", style=discord.ButtonStyle.primary, custom_id="admin:nav_main")
-        back_button.callback = self.go_to_main_menu
-        self.add_item(back_button)
+        super().__init__(timeout=None)
+        self.bot = bot
 
-        essentials_button = Button(label="Essentials", emoji="⭐", custom_id="admin:nav_essentials")
-        essentials_button.callback = self.go_to_essentials
-        self.add_item(essentials_button)
+    # Moderation
+    @discord.ui.button(label="Moderation", style=discord.ButtonStyle.primary, custom_id="op:menu:moderation")
+    async def moderation(self, interaction: discord.Interaction, _: discord.ui.Button):
+        if not admin_only(interaction):
+            return await _safe_ephemeral(interaction, "Admins only.")
+        from cogs.moderation_cog import ModerationParentView, build_moderation_embed
+        await _swap(interaction, build_moderation_embed(interaction.guild), ModerationParentView(self.bot))
 
-        moderation_button = Button(label="Moderation", emoji="🛡️", custom_id="admin:nav_moderation")
-        moderation_button.callback = self.go_to_moderation
-        self.add_item(moderation_button)
+    # Logging
+    @discord.ui.button(label="Logging", style=discord.ButtonStyle.secondary, custom_id="op:menu:logging")
+    async def logging(self, interaction: discord.Interaction, _: discord.ui.Button):
+        if not admin_only(interaction):
+            return await _safe_ephemeral(interaction, "Admins only.")
+        from cogs.logging_cog import LoggingSettingsView, build_logging_embed
+        await _swap(interaction, build_logging_embed(interaction.guild), LoggingSettingsView(self.bot))
 
-        tickets_button = Button(label="Tickets", emoji="🎫", custom_id="admin:nav_tickets")
-        tickets_button.callback = self.go_to_tickets
-        self.add_item(tickets_button)
+    # Tickets
+    @discord.ui.button(label="Tickets", style=discord.ButtonStyle.secondary, custom_id="op:menu:tickets")
+    async def tickets(self, interaction: discord.Interaction, _: discord.ui.Button):
+        if not admin_only(interaction):
+            return await _safe_ephemeral(interaction, "Admins only.")
+        from cogs.ticket_cog import TicketSettingsView, build_ticket_embed
+        await _swap(interaction, build_ticket_embed(interaction.guild), TicketSettingsView(self.bot))
 
-        logging_button = Button(label="Logging", emoji="📜", custom_id="admin:nav_logging")
-        logging_button.callback = self.go_to_logging
-        self.add_item(logging_button)
+    # Giveaways
+    @discord.ui.button(label="Giveaways", style=discord.ButtonStyle.secondary, custom_id="op:menu:giveaways")
+    async def giveaways(self, interaction: discord.Interaction, _: discord.ui.Button):
+        if not admin_only(interaction):
+            return await _safe_ephemeral(interaction, "Admins only.")
+        from cogs.giveaways_cog import GiveawaysPanelView, build_gw_panel
+        await _swap(interaction, build_gw_panel(interaction.guild), GiveawaysPanelView(self.bot))
 
-        purge_button = Button(label="Purge", emoji="🗑️", custom_id="admin:nav_purge")
-        purge_button.callback = self.go_to_purge
-        self.add_item(purge_button)
+    # Purge Tools
+    @discord.ui.button(label="Purge Tools", style=discord.ButtonStyle.secondary, custom_id="op:menu:purge")
+    async def purge_tools(self, interaction: discord.Interaction, _: discord.ui.Button):
+        if not admin_only(interaction):
+            return await _safe_ephemeral(interaction, "Admins only.")
+        from cogs.purge_cog import PurgePanelView, build_purge_embed
+        await _swap(interaction, build_purge_embed(interaction.guild), PurgePanelView(self.bot))
 
-        giveaways_button = Button(label="Giveaways", emoji="🎉", custom_id="admin:nav_giveaways")
-        giveaways_button.callback = self.go_to_giveaways
-        self.add_item(giveaways_button)
+    # Music
+    @discord.ui.button(label="Music", style=discord.ButtonStyle.secondary, custom_id="op:menu:music")
+    async def music(self, interaction: discord.Interaction, _: discord.ui.Button):
+        if not admin_only(interaction):
+            return await _safe_ephemeral(interaction, "Admins only.")
+        from cogs.music_cog import MusicPanelView, build_music_embed
+        # live embed pulls now/queue when the view refreshes; this one is static
+        await _swap(interaction, build_music_embed(interaction.guild), MusicPanelView(self.bot))
 
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if not (interaction.user.guild_permissions.manage_guild or interaction.user.guild_permissions.administrator):
-            await interaction.response.send_message("❌ You need the **Manage Server** or **Administrator** permission to use this menu.", ephemeral=True)
-            return False
-        return True
+    # Essentials
+    @discord.ui.button(label="Essentials", style=discord.ButtonStyle.secondary, custom_id="op:menu:essentials")
+    async def essentials(self, interaction: discord.Interaction, _: discord.ui.Button):
+        if not admin_only(interaction):
+            return await _safe_ephemeral(interaction, "Admins only.")
+        from cogs.essentials_cog import EssentialsView, build_essentials_embed
+        await _swap(interaction, build_essentials_embed(interaction.guild, bot=self.bot), EssentialsView(self.bot))
 
-    async def go_to_main_menu(self, interaction: discord.Interaction):
-        embed = create_embed("👋 Welcome!", "Please choose a menu to continue.", discord.Color.blurple())
-        view = MainMenuSelectionView(self.bot)
-        await interaction.response.edit_message(embed=embed, view=view)
 
-    async def go_to_moderation(self, interaction: discord.Interaction) -> None:
-        from .moderation_cog import ModerationParentView
-        embed = create_embed("🛡️ Moderation Settings", "Configure AI-powered auto-moderation and anti-raid protection.", discord.Color.blue())
-        view = ModerationParentView(self.bot)
-        await interaction.response.edit_message(embed=embed, view=view)
-        view.message = await interaction.original_response()
+# ----------------- helpers -----------------
 
-    async def go_to_tickets(self, interaction: discord.Interaction) -> None:
-        from .ticket_cog import TicketSettingsView
-        embed = create_embed("🎫 Ticket Settings", "Manage ticket panels and settings.", discord.Color.green())
-        view = TicketSettingsView(self.bot)
-        await interaction.response.edit_message(embed=embed, view=view)
-        view.message = await interaction.original_response()
+async def _swap(interaction: discord.Interaction, embed: discord.Embed, view: discord.ui.View):
+    try:
+        if interaction.response.is_done():
+            await interaction.edit_original_response(embed=embed, view=view)
+        else:
+            await interaction.response.edit_message(embed=embed, view=view)
+    except Exception:
+        pass
 
-    async def go_to_logging(self, interaction: discord.Interaction) -> None:
-        from .logging_cog import LoggingSettingsView
-        embed = create_embed("📜 Logging Settings", "Choose which server events to log.", discord.Color.orange())
-        config = await self.bot.get_guild_config(interaction.guild.id)
-        view = LoggingSettingsView(self.bot, interaction.guild.id, config)
-        await interaction.response.edit_message(embed=embed, view=view)
-        view.message = await interaction.original_response()
-        
-    async def go_to_essentials(self, interaction: discord.Interaction) -> None:
-        from .essentials_cog import EssentialsSettingsView
-        embed = create_embed("⭐ Essentials", "Configure welcome messages, reaction roles, and other essential features.", discord.Color.gold())
-        view = EssentialsSettingsView(self.bot)
-        await interaction.response.edit_message(embed=embed, view=view)
-        view.message = await interaction.original_response()
-        
-    async def go_to_purge(self, interaction: discord.Interaction) -> None:
-        from .purge_cog import PurgeSettingsView
-        embed = create_embed("🗑️ Purge Messages", "Select a purge method.", discord.Color.dark_grey())
-        view = PurgeSettingsView(self.bot)
-        await interaction.response.edit_message(embed=embed, view=view)
-        view.message = await interaction.original_response()
-        
-    async def go_to_giveaways(self, interaction: discord.Interaction) -> None:
-        from .giveaways_cog import GiveawaysSettingsView
-        embed = create_embed("🎉 Giveaways", "Create and manage server giveaways.", discord.Color.from_rgb(255, 105, 180))
-        view = GiveawaysSettingsView(self.bot)
-        await interaction.response.edit_message(embed=embed, view=view)
-        view.message = await interaction.original_response()
 
-class MainMenuSelectionView(BaseSettingsView):
-    """The initial view for the /menu command, allowing users to select Music or Staff menu."""
-    def __init__(self, bot: commands.Bot):
-        super().__init__(bot)
+async def _safe_ephemeral(interaction: discord.Interaction, content: str):
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(content, ephemeral=True)
+        else:
+            await interaction.response.send_message(content, ephemeral=True)
+    except Exception:
+        pass
 
-    @discord.ui.button(label="Music", style=discord.ButtonStyle.secondary, emoji="🎶")
-    async def music_menu(self, interaction: discord.Interaction, button: Button):
-        logger.info(f"User {interaction.user} accessed Music Menu in guild {interaction.guild.id}")
-        embed = create_embed("🎶 Music Player", "Use the buttons below to control the music.", discord.Color.purple())
-        view = MusicPlayerView(self.bot)
-        await interaction.response.edit_message(embed=embed, view=view)
-        view.message = await interaction.original_response()
 
-    @discord.ui.button(label="Staff Menu", style=discord.ButtonStyle.primary, emoji="🛡️")
-    async def staff_menu(self, interaction: discord.Interaction, button: Button):
-        if not interaction.user.guild_permissions.manage_guild:
-            await interaction.response.send_message("❌ You need the **Manage Server** permission to use this menu.", ephemeral=True)
-            return
-            
-        logger.info(f"User {interaction.user} accessed Staff Menu in guild {interaction.guild.id}")
-        embed = create_embed("🛡️ Staff Menu", "Select a category to configure.", discord.Color.blue())
-        view = StaffMenuView(self.bot)
-        await interaction.response.edit_message(embed=embed, view=view)
-        view.message = await interaction.original_response()
+# ----------------- Cog -----------------
 
-# --- Cog Loader ---
 class MenuCog(commands.Cog):
-    """A cog for handling the main /menu command and initial navigation."""
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
-    @app_commands.command(name="menu", description="Access bot features and settings.")
-    @app_commands.checks.cooldown(1, 5.0, key=lambda i: (i.guild_id, i.user.id))
-    async def menu(self, interaction: discord.Interaction):
-        """Displays the main menu selection."""
-        embed = create_embed("👋 Welcome!", "Please choose a menu to continue.", discord.Color.blurple())
-        view = MainMenuSelectionView(self.bot)
-        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
-        view.message = await interaction.original_response()
+    async def cog_load(self) -> None:
+        # Register persistent view so the main menu buttons survive restarts
+        try:
+            self.bot.add_view(MainMenuView(self.bot))
+        except Exception:
+            pass
 
-    @menu.error
-    async def menu_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
-        if isinstance(error, app_commands.CommandOnCooldown):
-            await interaction.response.send_message(f"❌ Please wait {error.retry_after:.1f} seconds before using this command again.", ephemeral=True)
-        else:
-            logger.error(f"An error occurred in the menu command: {error}")
-            await interaction.response.send_message("An unexpected error occurred.", ephemeral=True)
 
 async def setup(bot: commands.Bot):
-    """Adds the MenuCog to the bot."""
     await bot.add_cog(MenuCog(bot))
+    try:
+        bot.add_view(MainMenuView(bot))
+    except Exception:
+        pass
