@@ -1,0 +1,18 @@
+# Ignore Python cache
+__pycache__/
+*.pyc
+
+# Ignore virtual environment
+venv/
+
+# Ignore logs
+logs/
+
+# Ignore secrets
+.env
+
+# Ignore node modules
+node_modules/
+
+# Ignore editor settings
+.vscode/

@@ -1,0 +1,5 @@
+discord.py==2.3.2
+pymongo==4.7.3
+python-dotenv==1.0.1
+transformers==4.42.4
+torch==2.7.1
